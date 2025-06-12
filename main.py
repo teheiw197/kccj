@@ -443,7 +443,7 @@ class KCCJPlugin(Star):
                         # 发送预览消息
                         await self.context.send_message(user_id, [{"type": "plain", "text": preview_msg}])
                         # 询问是否开启明日提醒
-                        await self.context.send_message(user_id, [{"type": "plain", "text": "是否开启明日课程提醒？回复"是"开启提醒。"}])
+                        await self.context.send_message(user_id, [{"type": "plain", "text": "是否开启明日课程提醒？回复'是'开启提醒。"}])
             await asyncio.sleep(60)  # 每分钟检查一次
 
     def format_daily_preview(self, course_info):
