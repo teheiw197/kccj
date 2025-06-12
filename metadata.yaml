@@ -1,0 +1,7 @@
+name: kccj
+author: AstrBot
+desc: 课程提醒插件 - 支持课程表解析、自动提醒、每日预览等功能
+version: 1.0.0
+repo: https://github.com/teheiw197/kccj
+reserved: false
+activated: true 

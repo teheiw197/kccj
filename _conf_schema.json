@@ -1,0 +1,74 @@
+{
+  "reminder_settings": {
+    "description": "提醒设置",
+    "type": "object",
+    "items": {
+      "reminder_time": {
+        "description": "课前提醒时间(分钟)",
+        "type": "int",
+        "default": 30,
+        "hint": "设置在上课前多少分钟发送提醒"
+      },
+      "daily_preview_time": {
+        "description": "每日预览时间",
+        "type": "string",
+        "default": "23:00",
+        "hint": "设置每日预览的发送时间,格式为HH:MM"
+      },
+      "enable_daily_preview": {
+        "description": "是否启用每日预览",
+        "type": "bool",
+        "default": true,
+        "hint": "是否在每天晚上发送第二天的课程预览"
+      }
+    }
+  },
+  "message_templates": {
+    "description": "消息模板设置",
+    "type": "object",
+    "items": {
+      "reminder_template": {
+        "description": "课程提醒模板",
+        "type": "text",
+        "default": "同学你好，待会有课哦\n上课时间：{time}\n课程名称：{name}\n教师：{teacher}\n上课地点：{location}",
+        "hint": "课程提醒消息的模板,可用变量: {time}, {name}, {teacher}, {location}"
+      },
+      "preview_template": {
+        "description": "每日预览模板",
+        "type": "text",
+        "default": "明天（星期{weekday}）的课程安排：\n\n{courses}",
+        "hint": "每日预览消息的模板,可用变量: {weekday}, {courses}"
+      },
+      "course_template": {
+        "description": "课程信息模板",
+        "type": "text",
+        "default": "• 上课时间：{time}\n课程名称：{name}\n教师：{teacher}\n上课地点：{location}",
+        "hint": "单个课程信息的模板,可用变量: {time}, {name}, {teacher}, {location}"
+      }
+    }
+  },
+  "notification_settings": {
+    "description": "通知设置",
+    "type": "object",
+    "items": {
+      "enable_reminder": {
+        "description": "是否启用课程提醒",
+        "type": "bool",
+        "default": true,
+        "hint": "是否启用课前提醒功能"
+      },
+      "enable_weekend_reminder": {
+        "description": "是否启用周末提醒",
+        "type": "bool",
+        "default": false,
+        "hint": "是否在周末也发送课程提醒"
+      },
+      "enable_evening_reminder": {
+        "description": "是否启用晚间课程提醒",
+        "type": "bool",
+        "default": true,
+        "hint": "是否发送晚间课程的提醒"
+      }
+    }
+  }
+} 
