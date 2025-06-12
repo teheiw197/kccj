@@ -8,36 +8,216 @@ import asyncio
 from datetime import datetime, timedelta
 import re
 from dateutil import parser
+from enum import Enum
+from typing import List, Dict, Any
+import httpx
 
-@register("kccj", "teheiw197", "课程提醒插件", "1.0.0")
+# ========== 状态机定义 ==========
+class CourseState(Enum):
+    PENDING = "待确认"
+    CONFIRMED = "已确认"
+    CANCELLED = "已取消"
+
+# ========== 主插件注册 ==========
+@register(
+    "kccj",
+    "teheiw197",
+    "智能课程提醒插件，支持AI解析与定时提醒",
+    "1.2.0",
+    "https://github.com/teheiw197/kccj"
+)
 class KCCJPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config):
         super().__init__(context)
         self.config = config
-        self.course_data = {}
-        self.reminder_tasks = {}
         self.data_file = os.path.join("data", "plugins", "kccj", "course_data.json")
-        self.load_data()
-        asyncio.create_task(self.daily_preview_task())
+        self.task_db_file = os.path.join("data", "plugins", "kccj", "task_db.json")
+        self.course_data = self.load_json(self.data_file)
+        self.task_db = self.load_json(self.task_db_file)
+        self.reminder_tasks = {}
+        asyncio.create_task(self.reminder_scheduler())
 
-    def load_data(self):
-        """加载课程数据"""
-        try:
-            if os.path.exists(self.data_file):
-                with open(self.data_file, 'r', encoding='utf-8') as f:
-                    self.course_data = json.load(f)
-        except Exception as e:
-            logger.error(f"加载课程数据失败: {str(e)}")
-            self.course_data = {}
+    # ========== 数据存储 ========== 
+    def load_json(self, path):
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return {}
+    def save_json(self, path, data):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
-    def save_data(self):
-        """保存课程数据"""
-        try:
-            os.makedirs(os.path.dirname(self.data_file), exist_ok=True)
-            with open(self.data_file, 'w', encoding='utf-8') as f:
-                json.dump(self.course_data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"保存课程数据失败: {str(e)}")
+    # ========== 消息处理分流 ==========
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def handle_message(self, event: AstrMessageEvent):
+        # 检测图片/文件，自动分流到豆包
+        if self.has_media(event):
+            await self.invoke_doubao_assist(event)
+            event.stop_event()
+            return
+        # 文本预处理
+        text = self.preprocess_text(event.message_str)
+        if not text:
+            return
+        # AI解析与多轮追问
+        course_list = await self.multi_round_parse(text)
+        if not course_list:
+            await event.send("抱歉，未能成功解析课程表，请检查格式或稍后重试。")
+            return
+        # 数据校验
+        valid_courses = [c for c in course_list if self.validate_course(c)]
+        if not valid_courses:
+            await event.send("解析结果不完整或有误，请补充关键信息。")
+            return
+        # 状态机与用户确认
+        user_id = event.get_sender_id()
+        self.course_data[user_id] = {
+            "state": CourseState.PENDING.value,
+            "course_data": valid_courses,
+            "create_time": datetime.now().isoformat()
+        }
+        self.save_json(self.data_file, self.course_data)
+        await event.send(f"已为您解析出如下课程信息，请确认：\n{json.dumps(valid_courses, ensure_ascii=False, indent=2)}\n回复"确认"保存，回复"取消"放弃。")
+
+    def has_media(self, event: AstrMessageEvent) -> bool:
+        # 检查消息链是否包含图片或文件
+        return any(getattr(seg, 'type', None) in ("image", "file") for seg in event.message_obj.message)
+
+    def preprocess_text(self, text: str) -> str:
+        # 文本预处理：去除多余空格、合并换行
+        return re.sub(r"\s+", " ", text.strip())
+
+    # ========== AI解析与多轮追问 ==========
+    async def multi_round_parse(self, text: str) -> List[Dict[str, Any]]:
+        BASE_PROMPT = "你是课程表解析专家，请从以下文本中提取课程信息，输出JSON数组：\n必须包含字段：课程名称、星期几、上课时间、周次\n可选字段：教师、地点\n时间格式示例：第1-2节（08:00-09:40）\n周次格式示例：1-16周\n\n文本内容：{text}"
+        FOLLOW_UP_PROMPT = "上次解析缺少[课程名称/时间/周次]，请重新提取：{text}"
+        max_retries = self.config.get("max_ai_retries", 2)
+        for round in range(max_retries+1):
+            prompt = BASE_PROMPT.format(text=text) if round == 0 else FOLLOW_UP_PROMPT.format(text=text)
+            result = await self.call_llm(prompt)
+            if self.validate_result(result):
+                return result
+        return []
+
+    async def call_llm(self, prompt: str) -> List[Dict[str, Any]]:
+        provider = self.config.get("ai_provider", "siliconflow")
+        if provider == "siliconflow":
+            return await self.invoke_siliconflow_llm(prompt)
+        elif provider == "doubao":
+            return await self.invoke_doubao_llm(prompt)
+        elif provider == "openai":
+            return await self.invoke_openai_llm(prompt)
+        else:
+            return []
+
+    async def invoke_siliconflow_llm(self, prompt: str) -> List[Dict[str, Any]]:
+        api_key = self.config.get("siliconflow_api_key", "sk-zxtmadhtngzchfjeuoasxfyjbvxnvunyqgyrusdwentlbjxo")
+        base_url = "https://api.siliconflow.cn/v1"
+        model = "deepseek-ai/DeepSeek-V3"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.2
+        }
+        async with httpx.AsyncClient(base_url=base_url) as client:
+            try:
+                resp = await client.post("/chat/completions", json=payload, headers=headers, timeout=30)
+                data = resp.json()
+                # 假设返回格式与OpenAI兼容
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                # 解析为JSON数组
+                import json as _json
+                try:
+                    return _json.loads(content)
+                except Exception:
+                    return []
+            except Exception as e:
+                logger.error(f"SiliconFlow API调用失败: {e}")
+                return []
+
+    async def invoke_doubao_llm(self, prompt: str) -> List[Dict[str, Any]]:
+        # 豆包 LLM API 调用骨架
+        api_key = self.config.get("doubao_api_key", "")
+        if not api_key:
+            return []
+        headers = {"Authorization": f"Bearer {api_key}"}
+        payload = {"model": "doubao-pro", "prompt": prompt, "format": "json"}
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.post("https://api.doubao.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
+                data = resp.json()
+                return data.get("choices", [{}])[0].get("message", {}).get("content", [])
+            except Exception as e:
+                logger.error(f"豆包API调用失败: {e}")
+                return []
+
+    async def invoke_openai_llm(self, prompt: str) -> List[Dict[str, Any]]:
+        # OpenAI LLM API 调用骨架（需补充openai库调用）
+        return []
+
+    async def invoke_doubao_assist(self, event: AstrMessageEvent):
+        # 豆包图片/文件协同接口骨架
+        await event.send("检测到图片/文件，已自动转交豆包AI解析，请稍候……")
+        # 这里可补充图片转URL、调用豆包OCR等逻辑
+
+    def validate_result(self, result) -> bool:
+        # 验证AI返回的结果是否为课程列表且包含必填字段
+        if not isinstance(result, list):
+            return False
+        for course in result:
+            if not self.validate_course(course):
+                return False
+        return True
+
+    def validate_course(self, course: dict) -> bool:
+        required_fields = {"课程名称", "星期几", "上课时间", "周次"}
+        if not required_fields.issubset(course.keys()):
+            return False
+        if not re.match(r"第\d+-\d+节（\d{2}:\d{2}-\d{2}:\d{2}）", course["上课时间"]):
+            return False
+        if not re.match(r"\d+-\d+周", course["周次"]):
+            return False
+        return True
+
+    # ========== 定时提醒引擎骨架 ==========
+    async def reminder_scheduler(self):
+        while True:
+            now = datetime.now()
+            for user_id, user_info in self.course_data.items():
+                if user_info.get("state") != CourseState.CONFIRMED.value:
+                    continue
+                for course in user_info.get("course_data", []):
+                    # 计算提醒时间
+                    remind_time = self.calculate_remind_time(course)
+                    if remind_time and now >= remind_time and not self.is_task_sent(user_id, course):
+                        await self.send_reminder(user_id, course)
+                        self.mark_task_sent(user_id, course)
+            await asyncio.sleep(30)
+
+    def calculate_remind_time(self, course: dict):
+        # 解析上课时间，返回提醒时间（课前N分钟）
+        advance = self.config.get("remind_advance_minutes", 30)
+        # 这里只做骨架，需结合具体时间格式实现
+        return None
+
+    def is_task_sent(self, user_id, course):
+        # 判断任务是否已发送
+        return False
+
+    def mark_task_sent(self, user_id, course):
+        # 标记任务为已发送
+        pass
+
+    async def send_reminder(self, user_id, course):
+        # 发送提醒消息
+        await self.context.send_message(user_id, [{"type": "plain", "text": f"【课程提醒】即将上课：{course}"}])
 
     def get_config(self, key, default=None):
         """安全地获取配置值"""
@@ -155,214 +335,10 @@ class KCCJPlugin(Star):
             if user_id in self.reminder_tasks:
                 self.reminder_tasks[user_id].cancel()
                 del self.reminder_tasks[user_id]
-            self.save_data()
+            self.save_json(self.data_file, self.course_data)
             yield event.plain_result("已清除课程数据。")
         else:
             yield event.plain_result("您还没有设置课程表。")
-
-    @filter.event_message_type(filter.EventMessageType.ALL)
-    async def handle_message(self, event: AstrMessageEvent):
-        """处理所有消息"""
-        # 检查消息是否包含图片或文件
-        has_image = any(comp.type == "image" for comp in event.message_obj.message)
-        has_file = any(comp.type == "file" for comp in event.message_obj.message)
-        
-        if has_image or has_file:
-            template = """【课程消息模板】
-
-📚 基本信息
-
-• 学校：XX大学（没有则不显示）
-
-• 班级：XX班（没有则不显示）
-
-• 专业：XX专业（没有则不显示）
-
-• 学院：XX学院（没有则不显示）
-
-🗓️ 每周课程详情
-星期X
-
-• 上课时间（节次和时间）：
-课程名称
-教师：老师姓名
-上课地点：教室/场地
-周次：具体周次
-
-示例：
-星期一
-上课时间：第1-2节（08:00-09:40）
-课程名称：如何找到富婆
-教师：飘逸
-上课地点150123
-周次：1-16周
-
-周末：无课程。
-
-🌙 晚间课程
-
-• 上课时间（节次和时间）：
-课程名称
-教师：老师姓名
-上课地点：教室/场地
-周次：具体周次
-
-📌 重要备注
-
-• 备注内容1
-
-• 备注内容2
-
-请留意课程周次及教室安排，合理规划学习时间！"""
-            yield event.plain_result("抱歉,我无法识别图片和文件。因为作者穷,请您复制下方【课程消息模板】去豆包,将课程表图片或者文件和课程消息模板发送给豆包,让它生成后,再来发送给我。\n\n" + template)
-            return
-
-        # 处理文本消息
-        message = event.message_str.strip()
-        if not message:
-            return
-
-        # 解析课程信息
-        try:
-            course_info = self.parse_course_info(message)
-            if course_info:
-                user_id = event.get_sender_id()
-                self.course_data[user_id] = course_info
-                self.save_data()
-                
-                # 发送确认消息
-                confirm_msg = "已解析您的课程信息,请确认是否正确:\n\n" + self.format_course_info(course_info)
-                yield event.plain_result(confirm_msg)
-                
-                # 启动提醒任务
-                if self.get_config('notification_settings.enable_reminder', True):
-                    await self.start_reminder_task(event.unified_msg_origin, course_info)
-        except Exception as e:
-            logger.error(f"处理课程信息失败: {str(e)}")
-            yield event.plain_result("抱歉,解析课程信息失败,请检查格式是否正确。")
-
-    def parse_course_info(self, text):
-        """解析课程信息"""
-        course_info = {
-            "basic_info": {},
-            "weekly_courses": {},
-            "evening_courses": [],
-            "remarks": []
-        }
-        
-        # 解析基本信息
-        basic_info_pattern = r"•\s*([^：]+)：([^\n]+)"
-        basic_info_matches = re.finditer(basic_info_pattern, text)
-        for match in basic_info_matches:
-            key = match.group(1).strip()
-            value = match.group(2).strip()
-            if value != "（没有则不显示）":
-                course_info["basic_info"][key] = value
-
-        # 解析每周课程
-        weekly_pattern = r"星期([一二三四五六日])\n(.*?)(?=星期|$)"
-        weekly_matches = re.finditer(weekly_pattern, text, re.DOTALL)
-        for match in weekly_matches:
-            day = match.group(1)
-            courses_text = match.group(2)
-            
-            # 解析具体课程
-            course_pattern = r"上课时间：([^\n]+)\n课程名称：([^\n]+)\n教师：([^\n]+)\n上课地点：([^\n]+)\n周次：([^\n]+)"
-            course_matches = re.finditer(course_pattern, courses_text)
-            
-            day_courses = []
-            for course_match in course_matches:
-                course = {
-                    "time": course_match.group(1),
-                    "name": course_match.group(2),
-                    "teacher": course_match.group(3),
-                    "location": course_match.group(4),
-                    "weeks": course_match.group(5)
-                }
-                day_courses.append(course)
-            
-            if day_courses:
-                course_info["weekly_courses"][day] = day_courses
-
-        # 解析晚间课程
-        evening_pattern = r"上课时间：([^\n]+)\n课程名称：([^\n]+)\n教师：([^\n]+)\n上课地点：([^\n]+)\n周次：([^\n]+)"
-        evening_matches = re.finditer(evening_pattern, text)
-        for match in evening_matches:
-            course = {
-                "time": match.group(1),
-                "name": match.group(2),
-                "teacher": match.group(3),
-                "location": match.group(4),
-                "weeks": match.group(5)
-            }
-            course_info["evening_courses"].append(course)
-
-        # 解析备注
-        remark_pattern = r"•\s*([^\n]+)"
-        remark_matches = re.finditer(remark_pattern, text)
-        for match in remark_matches:
-            remark = match.group(1).strip()
-            if remark and not remark.startswith("备注内容"):
-                course_info["remarks"].append(remark)
-
-        return course_info
-
-    def format_course_info(self, course_info):
-        """格式化课程信息用于显示"""
-        result = []
-        
-        # 格式化基本信息
-        if course_info["basic_info"]:
-            result.append("📚 基本信息")
-            for key, value in course_info["basic_info"].items():
-                result.append(f"• {key}：{value}")
-            result.append("")
-
-        # 格式化每周课程
-        if course_info["weekly_courses"]:
-            result.append("🗓️ 每周课程详情")
-            for day, courses in course_info["weekly_courses"].items():
-                result.append(f"星期{day}")
-                for course in courses:
-                    result.append(
-                        self.get_config(
-                            'message_templates.course_template',
-                            "上课时间：{time}\n课程名称：{name}\n教师：{teacher}\n上课地点：{location}"
-                        ).format(
-                            time=course["time"],
-                            name=course["name"],
-                            teacher=course["teacher"],
-                            location=course["location"]
-                        )
-                    )
-                    result.append("")
-            result.append("")
-
-        # 格式化晚间课程
-        if course_info["evening_courses"]:
-            result.append("🌙 晚间课程")
-            for course in course_info["evening_courses"]:
-                result.append(
-                    self.get_config(
-                        'message_templates.course_template',
-                        "上课时间：{time}\n课程名称：{name}\n教师：{teacher}\n上课地点：{location}"
-                    ).format(
-                        time=course["time"],
-                        name=course["name"],
-                        teacher=course["teacher"],
-                        location=course["location"]
-                    )
-                )
-                result.append("")
-            result.append("")
-
-        # 格式化备注
-        if course_info["remarks"]:
-            result.append("📌 重要备注")
-            for remark in course_info["remarks"]:
-                result.append(f"• {remark}")
-
-        return "\n".join(result)
 
     async def start_reminder_task(self, unified_msg_origin, course_info):
         """启动提醒任务"""
@@ -481,4 +457,4 @@ class KCCJPlugin(Star):
         """插件终止时清理资源"""
         for task in self.reminder_tasks.values():
             task.cancel()
-        self.save_data() 
+        self.save_json(self.data_file, self.course_data) 

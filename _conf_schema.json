@@ -70,5 +70,39 @@
         "hint": "是否发送晚间课程的提醒"
       }
     }
+  },
+  "ai_provider": {
+    "description": "AI模型提供商",
+    "type": "string",
+    "options": ["openai", "doubao", "siliconflow", "custom"],
+    "default": "siliconflow"
+  },
+  "openai_api_key": {
+    "description": "OpenAI API密钥",
+    "type": "string",
+    "hint": "使用OpenAI时必填",
+    "invisible": true
+  },
+  "doubao_api_key": {
+    "description": "豆包API密钥",
+    "type": "string",
+    "hint": "使用豆包时必填",
+    "invisible": true
+  },
+  "siliconflow_api_key": {
+    "description": "SiliconFlow API密钥",
+    "type": "string",
+    "hint": "使用SiliconFlow时必填",
+    "invisible": true
+  },
+  "remind_advance_minutes": {
+    "description": "提前提醒时间（分钟）",
+    "type": "int",
+    "default": 30
+  },
+  "max_ai_retries": {
+    "description": "AI解析最大重试次数",
+    "type": "int",
+    "default": 2
   }
 } 
