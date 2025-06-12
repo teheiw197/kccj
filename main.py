@@ -21,6 +21,8 @@ from nonebot import on_message, on_command
 from nonebot.rule import to_me
 from nonebot.permission import SUPERUSER
 from .ai_service import SiliconFlowService
+from .parser import parse_word, parse_xlsx, parse_image, parse_text_schedule
+import aiohttp
 
 # ========== 数据结构 ==========
 class Course:
@@ -520,10 +522,78 @@ async def handle_message(bot: Bot, event: Event, state: T_State):
     
     # 检查是否为图片/文件消息
     if any(seg.type in ["image", "file"] for seg in event.get_message()):
-        await bot.send(event, Message([
-            MessageSegment.text("请将图片/文件中的课程表转换为文本后发送。\n"),
-            MessageSegment.text("您可以使用豆包OCR等工具进行转换。")
-        ]))
+        # 获取文件信息
+        file_seg = next(seg for seg in event.get_message() if seg.type in ["image", "file"])
+        file_url = file_seg.data.get("url", "")
+        file_name = file_seg.data.get("name", "")
+        
+        if not file_url:
+            await bot.send(event, Message([MessageSegment.text("无法获取文件，请重试。")]))
+            return
+            
+        # 下载文件
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(file_url) as resp:
+                    if resp.status != 200:
+                        await bot.send(event, Message([MessageSegment.text("文件下载失败，请重试。")]))
+                        return
+                    file_data = await resp.read()
+        except Exception as e:
+            logger.error(f"下载文件失败: {str(e)}")
+            await bot.send(event, Message([MessageSegment.text("文件下载失败，请重试。")]))
+            return
+            
+        # 保存文件
+        ext = os.path.splitext(file_name)[-1].lower()
+        save_path = os.path.join(DATA_DIR, f"{user_id}{ext}")
+        try:
+            with open(save_path, "wb") as f:
+                f.write(file_data)
+        except Exception as e:
+            logger.error(f"保存文件失败: {str(e)}")
+            await bot.send(event, Message([MessageSegment.text("文件保存失败，请重试。")]))
+            return
+            
+        # 根据文件类型解析
+        try:
+            if ext in [".docx", ".doc"]:
+                courses = parse_word(save_path)
+            elif ext in [".xlsx", ".xls"]:
+                courses = parse_xlsx(save_path)
+            elif ext in [".jpg", ".jpeg", ".png", ".bmp"]:
+                courses = await parse_image(save_path, CONFIG.get("ocr_api_url", ""), CONFIG.get("ocr_api_key", ""))
+            else:
+                await bot.send(event, Message([MessageSegment.text("暂不支持该文件类型，请发送Word、Excel或图片格式的课程表。")]))
+                return
+                
+            if not courses:
+                await bot.send(event, Message([MessageSegment.text("未能从文件中识别出课程信息，请检查文件格式是否正确。")]))
+                return
+                
+            # 保存课程数据
+            user_data = load_user_data(user_id)
+            user_data["courses"] = courses
+            save_user_data(user_id, user_data)
+            
+            # 生成确认消息
+            confirm_msg = "已解析到以下课程：\n\n"
+            for course in courses:
+                confirm_msg += f"{course['weekday']} {course['time']} {course['course']}\n"
+                confirm_msg += f"教室：{course['classroom']} 教师：{course['teacher']}\n\n"
+            confirm_msg += "是否开启课程提醒？回复'是'开启提醒。"
+            
+            await bot.send(event, Message([MessageSegment.text(confirm_msg)]))
+            
+        except Exception as e:
+            logger.error(f"解析文件失败: {str(e)}")
+            await bot.send(event, Message([MessageSegment.text("解析文件失败，请检查文件格式是否正确。")]))
+        finally:
+            # 清理临时文件
+            try:
+                os.remove(save_path)
+            except:
+                pass
         return
 
     # 处理文本消息
@@ -532,7 +602,7 @@ async def handle_message(bot: Bot, event: Event, state: T_State):
         return
 
     # 尝试解析课程表
-    courses = await ai_service.parse_course_schedule(text)
+    courses = parse_text_schedule(text)
     if not courses:
         await bot.send(event, Message([
             MessageSegment.text("抱歉，我无法解析课程表。\n"),
@@ -550,7 +620,7 @@ async def handle_message(bot: Bot, event: Event, state: T_State):
     for course in courses:
         confirm_msg += f"{course['weekday']} {course['time']} {course['course']}\n"
         confirm_msg += f"教室：{course['classroom']} 教师：{course['teacher']}\n\n"
-    confirm_msg += "是否开启课程提醒？回复"是"开启提醒。"
+    confirm_msg += "是否开启课程提醒？回复'是'开启提醒。"
 
     await bot.send(event, Message([MessageSegment.text(confirm_msg)]))
 
@@ -674,7 +744,7 @@ async def send_daily_summary(bot: Bot, user_id: str, courses: List[Dict[str, Any
                 summary_msg += f"📍 教室：{course['classroom']}\n"
                 summary_msg += f"👨‍🏫 教师：{course['teacher']}\n\n"
             
-            summary_msg += "是否需要开启明日课程提醒？回复"是"开启提醒。"
+            summary_msg += "是否需要开启明日课程提醒？回复'是'开启提醒。"
         
         await bot.send_private_msg(user_id=user_id, message=Message([MessageSegment.text(summary_msg)]))
         
@@ -709,4 +779,50 @@ async def stop_reminder(bot: Bot, event: Event, state: T_State):
 # 更新课程表指令
 @on_command("update_schedule", permission=SUPERUSER)
 async def update_schedule(bot: Bot, event: Event, state: T_State):
-    await bot.send(event, Message([MessageSegment.text("请发送新的课程表。")])) 
+    await bot.send(event, Message([MessageSegment.text("请发送新的课程表。")]))
+
+# 添加新的命令处理器
+@on_command("schedule", aliases={"课表"})
+async def show_schedule(bot: Bot, event: Event, state: T_State):
+    """显示完整课程表"""
+    user_id = str(event.get_user_id())
+    user_data = load_user_data(user_id)
+    
+    if not user_data["courses"]:
+        await bot.send(event, Message([MessageSegment.text("你还没有上传课程表，请发送课程表。")]))
+        return
+        
+    msg = "📚 你的课程表：\n\n"
+    for course in user_data["courses"]:
+        msg += f"📅 {course['weekday']} {course['time']}\n"
+        msg += f"📖 {course['course']}\n"
+        msg += f"📍 {course['classroom']}\n"
+        msg += f"👨‍🏫 {course['teacher']}\n\n"
+    
+    await bot.send(event, Message([MessageSegment.text(msg)]))
+
+@on_command("today", aliases={"今日课程"})
+async def show_today(bot: Bot, event: Event, state: T_State):
+    """显示今日课程"""
+    user_id = str(event.get_user_id())
+    user_data = load_user_data(user_id)
+    
+    if not user_data["courses"]:
+        await bot.send(event, Message([MessageSegment.text("你还没有上传课程表，请发送课程表。")]))
+        return
+        
+    now = datetime.now()
+    today = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
+    
+    today_courses = [c for c in user_data["courses"] if c["weekday"] == today]
+    
+    if not today_courses:
+        msg = f"今天({today})没有课程安排，可以好好休息啦！😊"
+    else:
+        msg = f"📚 今日({today})课程安排：\n\n"
+        for course in today_courses:
+            msg += f"⏰ {course['time']} {course['course']}\n"
+            msg += f"📍 {course['classroom']}\n"
+            msg += f"👨‍🏫 {course['teacher']}\n\n"
+    
+    await bot.send(event, Message([MessageSegment.text(msg)])) 
