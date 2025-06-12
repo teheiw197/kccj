@@ -53,7 +53,24 @@ class KCCJPlugin(Star):
     async def handle_message(self, event: AstrMessageEvent, *args, **kwargs):
         try:
             if self.has_media(event):
-                await self.send_msg(event, "检测到图片/文件，请先用OCR转为文本后再发送。")
+                template = (
+                    "【姓名同学学年学期课程安排】\n\n"
+                    "📚 基本信息\n\n"
+                    "• 学校：XX大学（没有则不显示）\n"
+                    "• 班级：XX班（没有则不显示）\n"
+                    "• 专业：XX专业（没有则不显示）\n"
+                    "• 学院：XX学院（没有则不显示）\n\n"
+                    "🗓️ 每周课程详情\n星期X\n\n"
+                    "• 上课时间（节次和时间）：\n课程名称\n教师：老师姓名\n上课地点：教室/场地\n周次：具体周次\n\n"
+                    "示例：\n星期一\n上课时间：第1-2节（08:00-09:40）\n课程名称：如何找到富婆\n教师：飘逸\n上课地点150123\n周次：1-16周\n\n"
+                    "周末：无课程。\n\n"
+                    "🌙 晚间课程\n\n• 上课时间（节次和时间）：\n课程名称\n教师：老师姓名\n上课地点：教室/场地\n周次：具体周次\n\n"
+                    "📌 重要备注\n\n• 备注内容1\n• 备注内容2\n\n请留意课程周次及教室安排，合理规划学习时间！"
+                )
+                msg = (
+                    "抱歉，我无法识别图片和文件，因为作者穷。请复制下方【课程消息模板】去豆包，将课程表图片或者文件和课程消息模板发送给豆包，让它生成后，再来发送给我。\n\n" + template
+                )
+                await self.send_msg(event, msg)
                 event.stop_event()
                 return
             text = self.preprocess_text(event.message_str)
@@ -74,7 +91,13 @@ class KCCJPlugin(Star):
                 "create_time": datetime.now().isoformat()
             }
             self.save_json(self.data_file, self.course_data)
-            await self.send_msg(event, f"已为您解析出如下课程信息，请确认：\n{json.dumps(valid_courses, ensure_ascii=False, indent=2)}\n回复'确认'保存，回复'取消'放弃。")
+            # 课表确认
+            confirm_text = (
+                "已为您解析出如下课程信息，请确认：\n" +
+                json.dumps(valid_courses, ensure_ascii=False, indent=2) +
+                "\n回复'确认'保存，回复'取消'放弃。"
+            )
+            await self.send_msg(event, confirm_text)
         except Exception as e:
             logger.error(f"handle_message error: {e}")
             await self.send_msg(event, "插件处理消息时发生错误，请联系管理员。")
@@ -156,9 +179,24 @@ class KCCJPlugin(Star):
                 for course in user_info.get("course_data", []):
                     remind_time = self.calculate_remind_time(course)
                     if remind_time and now >= remind_time and not self.is_task_sent(user_id, course):
+                        # 自动私信提醒
                         await self.send_reminder(user_id, course)
                         self.mark_task_sent(user_id, course)
-            await asyncio.sleep(30)
+            # 每天23:00发送次日课程预览
+            if now.hour == 23 and now.minute == 0:
+                for user_id, user_info in self.course_data.items():
+                    if user_info.get("state") == CourseState.CONFIRMED.value:
+                        preview_msg = self.format_daily_preview(user_info)
+                        if preview_msg:
+                            await self.context.send_message(
+                                user_id,
+                                [{"type": "plain", "text": preview_msg}]
+                            )
+                            await self.context.send_message(
+                                user_id,
+                                [{"type": "plain", "text": "是否开启明日课程提醒？回复'是'开启提醒。"}]
+                            )
+            await asyncio.sleep(60)
 
     def calculate_remind_time(self, course: dict):
         advance = self.config.get("remind_advance_minutes", 30)
@@ -170,11 +208,18 @@ class KCCJPlugin(Star):
     def mark_task_sent(self, user_id, course):
         pass
 
-    async def send_reminder(self, event, course):
+    async def send_reminder(self, user_id, course):
         try:
+            msg = (
+                "同学你好，待会有课哦\n"
+                f"上课时间（节次和时间）：{course.get('上课时间','')}\n"
+                f"课程名称：{course.get('课程名称','')}\n"
+                f"教师：{course.get('教师','')}\n"
+                f"上课地点：{course.get('上课地点','')}"
+            )
             await self.context.send_message(
-                event.unified_msg_origin,
-                [{"type": "plain", "text": f"【课程提醒】即将上课：{course}"}]
+                user_id,
+                [{"type": "plain", "text": msg}]
             )
         except Exception as e:
             logger.error(f"send_reminder error: {e}")
@@ -424,4 +469,20 @@ class KCCJPlugin(Star):
             self.save_json(self.task_db_file, self.task_db)
             logger.info("kccj插件已安全终止并保存数据。")
         except Exception as e:
-            logger.error(f"terminate error: {e}") 
+            logger.error(f"terminate error: {e}")
+
+    @filter.command("testremind")
+    async def test_remind_command(self, event: AstrMessageEvent):
+        '''课程提醒测试指令'''
+        try:
+            test_msg = (
+                "【课程提醒测试】\n"
+                "上课时间：第1-2节（08:00-09:40）\n"
+                "课程名称：如何找到富婆\n"
+                "教师：飘逸\n"
+                "上课地点150123"
+            )
+            yield event.plain_result(test_msg)
+        except Exception as e:
+            logger.error(f"test_remind_command error: {e}")
+            yield event.plain_result("课程提醒测试失败，请联系管理员。") 
