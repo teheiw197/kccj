@@ -78,7 +78,7 @@ class KCCJPlugin(Star):
             "create_time": datetime.now().isoformat()
         }
         self.save_json(self.data_file, self.course_data)
-        await event.send(f"已为您解析出如下课程信息，请确认：\n{json.dumps(valid_courses, ensure_ascii=False, indent=2)}\n回复"确认"保存，回复"取消"放弃。")
+        await event.send(f"已为您解析出如下课程信息，请确认：\n{json.dumps(valid_courses, ensure_ascii=False, indent=2)}\n回复'确认'保存，回复'取消'放弃。")
 
     def has_media(self, event: AstrMessageEvent) -> bool:
         # 检查消息链是否包含图片或文件
