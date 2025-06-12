@@ -22,7 +22,7 @@ class CourseState(Enum):
 @register(
     "kccj",
     "teheiw197",
-    "智能课程提醒插件，支持AI解析与定时提醒",
+    "智能课程提醒插件，内置SiliconFlow大模型API",
     "1.2.0",
     "https://github.com/teheiw197/kccj"
 )
@@ -53,7 +53,7 @@ class KCCJPlugin(Star):
     async def handle_message(self, event: AstrMessageEvent):
         # 检测图片/文件，自动分流到豆包
         if self.has_media(event):
-            await self.invoke_doubao_assist(event)
+            await self.send_msg(event, "检测到图片/文件，请先用OCR转为文本后再发送。")
             event.stop_event()
             return
         # 文本预处理
@@ -63,12 +63,12 @@ class KCCJPlugin(Star):
         # AI解析与多轮追问
         course_list = await self.multi_round_parse(text)
         if not course_list:
-            await event.send("抱歉，未能成功解析课程表，请检查格式或稍后重试。")
+            await self.send_msg(event, "抱歉，未能成功解析课程表，请检查格式或稍后重试。")
             return
         # 数据校验
         valid_courses = [c for c in course_list if self.validate_course(c)]
         if not valid_courses:
-            await event.send("解析结果不完整或有误，请补充关键信息。")
+            await self.send_msg(event, "解析结果不完整或有误，请补充关键信息。")
             return
         # 状态机与用户确认
         user_id = event.get_sender_id()
@@ -78,7 +78,7 @@ class KCCJPlugin(Star):
             "create_time": datetime.now().isoformat()
         }
         self.save_json(self.data_file, self.course_data)
-        await event.send(f"已为您解析出如下课程信息，请确认：\n{json.dumps(valid_courses, ensure_ascii=False, indent=2)}\n回复'确认'保存，回复'取消'放弃。")
+        await self.send_msg(event, f"已为您解析出如下课程信息，请确认：\n{json.dumps(valid_courses, ensure_ascii=False, indent=2)}\n回复'确认'保存，回复'取消'放弃。")
 
     def has_media(self, event: AstrMessageEvent) -> bool:
         # 检查消息链是否包含图片或文件
@@ -95,21 +95,10 @@ class KCCJPlugin(Star):
         max_retries = self.config.get("max_ai_retries", 2)
         for round in range(max_retries+1):
             prompt = BASE_PROMPT.format(text=text) if round == 0 else FOLLOW_UP_PROMPT.format(text=text)
-            result = await self.call_llm(prompt)
+            result = await self.invoke_siliconflow_llm(prompt)
             if self.validate_result(result):
                 return result
         return []
-
-    async def call_llm(self, prompt: str) -> List[Dict[str, Any]]:
-        provider = self.config.get("ai_provider", "siliconflow")
-        if provider == "siliconflow":
-            return await self.invoke_siliconflow_llm(prompt)
-        elif provider == "doubao":
-            return await self.invoke_doubao_llm(prompt)
-        elif provider == "openai":
-            return await self.invoke_openai_llm(prompt)
-        else:
-            return []
 
     async def invoke_siliconflow_llm(self, prompt: str) -> List[Dict[str, Any]]:
         api_key = self.config.get("siliconflow_api_key", "sk-zxtmadhtngzchfjeuoasxfyjbvxnvunyqgyrusdwentlbjxo")
@@ -130,9 +119,7 @@ class KCCJPlugin(Star):
             try:
                 resp = await client.post("/chat/completions", json=payload, headers=headers, timeout=30)
                 data = resp.json()
-                # 假设返回格式与OpenAI兼容
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                # 解析为JSON数组
                 import json as _json
                 try:
                     return _json.loads(content)
@@ -142,33 +129,7 @@ class KCCJPlugin(Star):
                 logger.error(f"SiliconFlow API调用失败: {e}")
                 return []
 
-    async def invoke_doubao_llm(self, prompt: str) -> List[Dict[str, Any]]:
-        # 豆包 LLM API 调用骨架
-        api_key = self.config.get("doubao_api_key", "")
-        if not api_key:
-            return []
-        headers = {"Authorization": f"Bearer {api_key}"}
-        payload = {"model": "doubao-pro", "prompt": prompt, "format": "json"}
-        async with httpx.AsyncClient() as client:
-            try:
-                resp = await client.post("https://api.doubao.com/v1/chat/completions", json=payload, headers=headers, timeout=30)
-                data = resp.json()
-                return data.get("choices", [{}])[0].get("message", {}).get("content", [])
-            except Exception as e:
-                logger.error(f"豆包API调用失败: {e}")
-                return []
-
-    async def invoke_openai_llm(self, prompt: str) -> List[Dict[str, Any]]:
-        # OpenAI LLM API 调用骨架（需补充openai库调用）
-        return []
-
-    async def invoke_doubao_assist(self, event: AstrMessageEvent):
-        # 豆包图片/文件协同接口骨架
-        await event.send("检测到图片/文件，已自动转交豆包AI解析，请稍候……")
-        # 这里可补充图片转URL、调用豆包OCR等逻辑
-
     def validate_result(self, result) -> bool:
-        # 验证AI返回的结果是否为课程列表且包含必填字段
         if not isinstance(result, list):
             return False
         for course in result:
@@ -194,7 +155,6 @@ class KCCJPlugin(Star):
                 if user_info.get("state") != CourseState.CONFIRMED.value:
                     continue
                 for course in user_info.get("course_data", []):
-                    # 计算提醒时间
                     remind_time = self.calculate_remind_time(course)
                     if remind_time and now >= remind_time and not self.is_task_sent(user_id, course):
                         await self.send_reminder(user_id, course)
@@ -202,22 +162,20 @@ class KCCJPlugin(Star):
             await asyncio.sleep(30)
 
     def calculate_remind_time(self, course: dict):
-        # 解析上课时间，返回提醒时间（课前N分钟）
         advance = self.config.get("remind_advance_minutes", 30)
-        # 这里只做骨架，需结合具体时间格式实现
         return None
 
     def is_task_sent(self, user_id, course):
-        # 判断任务是否已发送
         return False
 
     def mark_task_sent(self, user_id, course):
-        # 标记任务为已发送
         pass
 
     async def send_reminder(self, user_id, course):
-        # 发送提醒消息
         await self.context.send_message(user_id, [{"type": "plain", "text": f"【课程提醒】即将上课：{course}"}])
+
+    async def send_msg(self, event: AstrMessageEvent, text: str):
+        await event.send([{"type": "plain", "text": text}])
 
     def get_config(self, key, default=None):
         """安全地获取配置值"""
