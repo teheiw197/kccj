@@ -50,35 +50,34 @@ class KCCJPlugin(Star):
 
     # ========== 消息处理分流 ==========
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def handle_message(self, event: AstrMessageEvent):
-        # 检测图片/文件，自动分流到豆包
-        if self.has_media(event):
-            await self.send_msg(event, "检测到图片/文件，请先用OCR转为文本后再发送。")
-            event.stop_event()
-            return
-        # 文本预处理
-        text = self.preprocess_text(event.message_str)
-        if not text:
-            return
-        # AI解析与多轮追问
-        course_list = await self.multi_round_parse(text)
-        if not course_list:
-            await self.send_msg(event, "抱歉，未能成功解析课程表，请检查格式或稍后重试。")
-            return
-        # 数据校验
-        valid_courses = [c for c in course_list if self.validate_course(c)]
-        if not valid_courses:
-            await self.send_msg(event, "解析结果不完整或有误，请补充关键信息。")
-            return
-        # 状态机与用户确认
-        user_id = event.get_sender_id()
-        self.course_data[user_id] = {
-            "state": CourseState.PENDING.value,
-            "course_data": valid_courses,
-            "create_time": datetime.now().isoformat()
-        }
-        self.save_json(self.data_file, self.course_data)
-        await self.send_msg(event, f"已为您解析出如下课程信息，请确认：\n{json.dumps(valid_courses, ensure_ascii=False, indent=2)}\n回复'确认'保存，回复'取消'放弃。")
+    async def handle_message(self, event: AstrMessageEvent, *args, **kwargs):
+        try:
+            if self.has_media(event):
+                await self.send_msg(event, "检测到图片/文件，请先用OCR转为文本后再发送。")
+                event.stop_event()
+                return
+            text = self.preprocess_text(event.message_str)
+            if not text:
+                return
+            course_list = await self.multi_round_parse(text)
+            if not course_list:
+                await self.send_msg(event, "抱歉，未能成功解析课程表，请检查格式或稍后重试。")
+                return
+            valid_courses = [c for c in course_list if self.validate_course(c)]
+            if not valid_courses:
+                await self.send_msg(event, "解析结果不完整或有误，请补充关键信息。")
+                return
+            user_id = event.get_sender_id()
+            self.course_data[user_id] = {
+                "state": CourseState.PENDING.value,
+                "course_data": valid_courses,
+                "create_time": datetime.now().isoformat()
+            }
+            self.save_json(self.data_file, self.course_data)
+            await self.send_msg(event, f"已为您解析出如下课程信息，请确认：\n{json.dumps(valid_courses, ensure_ascii=False, indent=2)}\n回复'确认'保存，回复'取消'放弃。")
+        except Exception as e:
+            logger.error(f"handle_message error: {e}")
+            await self.send_msg(event, "插件处理消息时发生错误，请联系管理员。")
 
     def has_media(self, event: AstrMessageEvent) -> bool:
         # 检查消息链是否包含图片或文件
@@ -171,11 +170,23 @@ class KCCJPlugin(Star):
     def mark_task_sent(self, user_id, course):
         pass
 
-    async def send_reminder(self, user_id, course):
-        await self.context.send_message(user_id, [{"type": "plain", "text": f"【课程提醒】即将上课：{course}"}])
+    async def send_reminder(self, event, course):
+        try:
+            await self.context.send_message(
+                event.unified_msg_origin,
+                [{"type": "plain", "text": f"【课程提醒】即将上课：{course}"}]
+            )
+        except Exception as e:
+            logger.error(f"send_reminder error: {e}")
 
     async def send_msg(self, event: AstrMessageEvent, text: str):
-        await event.send([{"type": "plain", "text": text}])
+        try:
+            await self.context.send_message(
+                event.unified_msg_origin,
+                [{"type": "plain", "text": text}]
+            )
+        except Exception as e:
+            logger.error(f"send_msg error: {e}")
 
     def get_config(self, key, default=None):
         """安全地获取配置值"""
@@ -186,27 +197,19 @@ class KCCJPlugin(Star):
 
     @filter.command("help")
     async def help_command(self, event: AstrMessageEvent):
-        """显示帮助信息"""
-        help_text = """课程提醒插件使用说明：
-
-1. 发送课程表
-直接发送课程表文本即可，格式需要符合模板要求。
-
-2. 命令列表：
-/help - 显示此帮助信息
-/test - 发送一条测试提醒
-/preview - 预览明天的课程
-/status - 查看当前提醒状态
-/stop - 停止课程提醒
-/start - 开启课程提醒
-/clear - 清除课程数据
-
-3. 注意事项：
-- 目前仅支持文本格式的课程表
-- 如果发送图片或文件，会提示使用豆包生成课程表文本
-- 课程提醒会在每节课前30分钟发送
-- 每天晚上23:00会发送第二天的课程预览"""
-        yield event.plain_result(help_text)
+        '''显示插件帮助信息'''
+        try:
+            help_text = (
+                "kccj 智能课程提醒插件\n"
+                "- 发送课程表文本，自动AI解析\n"
+                "- 支持课前提醒、每日预览\n"
+                "- 支持群聊/私聊自动适配\n"
+                "- 指令：/help 查看帮助\n"
+            )
+            yield event.plain_result(help_text)
+        except Exception as e:
+            logger.error(f"help_command error: {e}")
+            yield event.plain_result("帮助信息获取失败，请联系管理员。")
 
     @filter.command("test")
     async def test_command(self, event: AstrMessageEvent):
@@ -412,7 +415,13 @@ class KCCJPlugin(Star):
         return ""
 
     async def terminate(self):
-        """插件终止时清理资源"""
-        for task in self.reminder_tasks.values():
-            task.cancel()
-        self.save_json(self.data_file, self.course_data) 
+        '''插件被卸载/停用时调用，安全取消所有异步任务并保存数据'''
+        try:
+            for task in getattr(self, 'reminder_tasks', {}).values():
+                if task and not task.done():
+                    task.cancel()
+            self.save_json(self.data_file, self.course_data)
+            self.save_json(self.task_db_file, self.task_db)
+            logger.info("kccj插件已安全终止并保存数据。")
+        except Exception as e:
+            logger.error(f"terminate error: {e}") 
